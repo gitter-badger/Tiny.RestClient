@@ -73,6 +73,7 @@ namespace Tiny.Http
                 _serverAddress += "/";
             }
 
+            Settings = new TinySettings();
             _defaultFormatter = new JsonFormatter();
             var formatters = new List<IFormatter>
             {
@@ -86,9 +87,9 @@ namespace Tiny.Http
         #endregion
 
         /// <summary>
-        /// Add to all request the AcceptLanguage based on CurrentCulture of the Thread
+        /// Gets settings
         /// </summary>
-        public bool AddAcceptLanguageBasedOnCurrentCulture { get; set; }
+        public TinySettings Settings { get; private set; }
 
         /// <summary>
         /// Gets the default headers.
@@ -340,7 +341,7 @@ namespace Tiny.Http
 
                         if (formatter == null)
                         {
-                            if (response.Content.Headers.ContentType.MediaType != null)
+                            if (response.Content.Headers.ContentType?.MediaType != null)
                             {
                                 // TODO : optimize the seach of formatter ?
                                 // Try to find best formatter
@@ -647,7 +648,7 @@ namespace Tiny.Http
 
                     request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(deserializer.DefaultMediaType));
 
-                    if (AddAcceptLanguageBasedOnCurrentCulture)
+                    if (Settings.AddAcceptLanguageBasedOnCurrentCulture)
                     {
                         request.Headers.AcceptLanguage.Add(new StringWithQualityHeaderValue(CultureInfo.CurrentCulture.TwoLetterISOLanguageName));
                     }
@@ -671,13 +672,33 @@ namespace Tiny.Http
                     }
 
                     OnSendingRequest(requestId, uri, httpMethod);
-                    sw.Start();
-                    var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+                    request.Properties["RequestTimeout"] = Settings.DefaultTimeout;
+                    using (var cts = GetCancellationTokenSourceForTimeout(request, cancellationToken))
+                    {
+                        HttpResponseMessage httpResponse = null;
+                        try
+                        {
+                            sw.Start();
+                            httpResponse = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, cts?.Token ?? cancellationToken).ConfigureAwait(false);
+                            sw.Stop();
+                        }
+                        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                        {
+                            throw new TimeoutException();
+                        }
 
-                    sw.Stop();
-                    OnReceivedResponse(requestId, uri, httpMethod, response, sw.Elapsed);
-                    return response;
+                        OnReceivedResponse(requestId, uri, httpMethod, httpResponse, sw.Elapsed);
+                        return httpResponse;
+                    }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (TimeoutException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -711,6 +732,25 @@ namespace Tiny.Http
                     return _PatchMethod;
                 default:
                     throw new NotImplementedException();
+            }
+        }
+
+        private CancellationTokenSource GetCancellationTokenSourceForTimeout(
+                HttpRequestMessage request,
+                CancellationToken cancellationToken)
+        {
+            var timeout = Settings.DefaultTimeout;
+            if (timeout == Timeout.InfiniteTimeSpan)
+            {
+                // No need to create a CTS if there's no timeout
+                return null;
+            }
+            else
+            {
+                var cts = CancellationTokenSource
+                    .CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(timeout);
+                return cts;
             }
         }
 
